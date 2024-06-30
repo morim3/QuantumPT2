@@ -1,11 +1,12 @@
 
+
+import math
 import sys
 from typing import Any
 from openfermion import QubitOperator, jordan_wigner
 from typing import Optional, Union, Tuple, List, Sequence, Mapping
 from quri_parts.openfermion.operator import operator_from_openfermion_op
 from quri_parts.circuit.transpile import RZSetTranspiler
-# from quri_parts.algo.optimizer import SPSA, OptimizerStatus 
 from quri_parts.core.operator import (
     pauli_label,
     Operator,
@@ -13,6 +14,7 @@ from quri_parts.core.operator import (
     pauli_product,
     PAULI_IDENTITY,
 )
+from quri_parts.core.measurement import individual_pauli_measurement
 from quri_parts.circuit import LinearMappedUnboundParametricQuantumCircuit, PauliRotation
 from quri_parts.core.operator.representation import (
     BinarySymplecticVector,
@@ -21,48 +23,47 @@ from quri_parts.core.operator.representation import (
     transition_amp_comp_basis,
 )
 from quri_parts.core.state import ComputationalBasisState, ParametricCircuitQuantumState
+# from quri_parts.core.sampling.shots_allocator import (
+#     create_equipartition_shots_allocator,
+#     create_proportional_shots_allocator
+# )
 import numpy as np
 import scipy
 from scipy.sparse import coo_matrix
 import itertools
+import time
 
 sys.path.append("../")
-from utils.challenge_2024 import ChallengeSampling, ExceededError, problem_hamiltonian
-from problem.custom_spsa import SPSA, HillClimbing 
 
+from utils.challenge_2024 import ChallengeSampling, ExceededError, problem_hamiltonian
 challenge_sampling = ChallengeSampling()
 
 
+def _rounddown_to_unit(n: float, shot_unit: int) -> int:
+    return shot_unit * math.floor(n / shot_unit)
 
-class ADAPT_QSCI:
 
-    def initialize_state(self, cisd_coeffs):
+class QuantumPT2:
 
-        self.param_values: list = []
-        generators = []
-        coeffs_list = []
-        param_names = []
-
+    def construct_circuit(self, pauli_measure: PauliLabel):
+        circuit = LinearMappedUnboundParametricQuantumCircuit(
+            self.hf_state.qubit_count)
+        circuit += self.hf_state.circuit
         # print(cisd_coeffs)
-        for i, (coeffs, virtual, occupied) in enumerate(cisd_coeffs[::-1]):
+        for coeffs, virtual, occupied in self.cisd_coeffs[::-1]:
             if len(virtual) == 1:
-                # generators.append(([virtual[0], occupied[0]], (0, 1)))
-                generators.append(f"X{virtual[0]} Y{occupied[0]}")
+                pauli = [1, 2]
             else:
-                # generators.append(([virtual[0], virtual[1], occupied[0], occupied[1]], (0, 0, 0, 1)))
-                generators.append(f"X{virtual[0]} X{virtual[1]} X{occupied[0]} Y{occupied[1]}")
+                pauli = [1, 1, 1, 2]
 
+            theta = -2. * np.arctan(coeffs)
+            circuit.add_PauliRotation_gate(virtual+occupied, pauli, theta)
 
-            coeffs_list.append(1.)
-            param_names.append(f"param {i}")
-            theta = np.arctan(coeffs * 2) * 2
-            # theta = coeffs
-            self.param_values.append(theta)
+        if pauli_measure != PAULI_IDENTITY:
+            circuit.add_Pauli_gate(*pauli_measure.index_and_pauli_id_list)
 
-            
-        return PauliRotationCircuit(generators, coeffs_list, param_names, self.n_qubits)
+        return circuit
 
-            
     def __init__(
         self,
         hamiltonian: Operator,
@@ -70,117 +71,85 @@ class ADAPT_QSCI:
         n_qubits: int,
         n_ele_cas: int,
         sampler,
-        iter_max: int = 10,
         sampling_shots: int = 10**4,
-        post_selected: bool = True,
         atol: float = 1e-5,
-        max_num_converged: int = 1,
-        final_sampling_shots_coeff: float = 1.0,
-        check_duplicate: bool = True,
-        reset_ignored_inx_mode: int = 10,
-        hf_energy=None
+        total_shots=10**7
+
     ):
+
         hf_bits = 2 ** n_ele_cas - 1
-        self.initial_state = ComputationalBasisState(n_qubits, bits=hf_bits)
-        self.hf_energy = hf_energy
+        self.hf_state = ComputationalBasisState(n_qubits, bits=hf_bits)
+        self.cisd_coeffs = cisd_coeffs
 
         self.hamiltonian: Operator = hamiltonian
         self.n_qubits: int = n_qubits
         self.n_ele_cas: int = n_ele_cas
-        self.iter_max: int = iter_max
         self.sampling_shots: int = sampling_shots
         self.atol: float = atol
         self.sampler = sampler
-        self.post_selected: bool = post_selected
-        self.check_duplicate: bool = check_duplicate
-        # initialization
 
-        self.ignored_gen_inx = []
-        self.reset_ignored_inx_mode: int = reset_ignored_inx_mode if reset_ignored_inx_mode > 0 else iter_max
-        # convergence
-        assert max_num_converged >= 1
-        self.final_sampling_shots: int = int(final_sampling_shots_coeff * sampling_shots)
-        self.max_num_converged: int = max_num_converged
-        self.num_converged: int = 0
-        # results
-        self.qsci_energy_history: list = []
-        self.opt_energy_history: list = []
-        self.raw_energy_history = []
-        self.sampling_results_history = []
-        self.opt_param_value_history = []
-        self.corrected_energy = []
+        self.total_shots = total_shots
 
-        self.pauli_rotation_circuit_qsci = self.initialize_state(cisd_coeffs)
+    def run(self):
 
-    def run_qsci(self, circuit):
-        counts = self.sampler(circuit, self.sampling_shots)
-        comp_basis, heavy_bits = pick_up_bits_from_counts(
-            counts=counts,
-            n_qubits=self.n_qubits,
-            R_max=num_basis_symmetry_adapted_cisd(self.n_qubits),
-            threshold=1e-10,
-            post_select=self.post_selected,
-            n_ele=self.n_ele_cas,
-        )
-        if self.initial_state.bits not in np.array(heavy_bits):
-            comp_basis.append(self.initial_state)
+        weights = {
+            m: abs(self.hamiltonian[m].real)
+            for m in self.hamiltonian
+        }
+        weights_sum = sum(weights.values())
 
-        vec_qsci, val_qsci = diagonalize_effective_ham(self.hamiltonian, comp_basis)
+        shot_unit = 10
+        shot_allocs = {
+            m: int(self.total_shots * weights[m] / weights_sum / shot_unit) * shot_unit
+            for m in self.hamiltonian
+        }
+        # shot_allocs = {
+        #     m: int(self.total_shots / (len(self.hamiltonian)-1))
+        #     for m in self.hamiltonian if m != PAULI_IDENTITY
+        # }
+        shots_map = {pauli_set: n_shots for pauli_set,
+                     n_shots in shot_allocs.items()}
+        results_dict = {}
 
-        hf_index = np.where(np.array(heavy_bits) == self.initial_state.bits)[0][0]
-        return comp_basis, vec_qsci, val_qsci, vec_qsci[hf_index]
+        print("num non-zero shots paulis: ", np.count_nonzero(np.array(list(shot_allocs.values()))))
 
-    def cost_fn(self, param_values):
+        for n_pauli, (pauli_set, n_shot) in enumerate(shots_map.items()):
 
-        target_circuit = self.parametric_state_qsci.parametric_circuit.bind_parameters(param_values)
-        transpiled_circuit = RZSetTranspiler()(target_circuit)
+            if n_shot == 0:
+                continue
 
-        comp_basis, vec_qsci, val_qsci, hf_vec_qsci = self.run_qsci(transpiled_circuit)
+            # if n_pauli % 50 == 0:
+            #     print("sampler time", time.time() - challenge_sampling.init_time)
 
-        print("param_values", param_values)
-        print(f"num basis: {len(comp_basis)}")
-        print(f"qsci energy for this param values: {val_qsci}")
-        print(f"hf_energy: ", self.hf_energy, " hf_vec: ", hf_vec_qsci)
-        # print(f"davidson correction: {val_qsci + (1-hf_vec_qsci**2) * (val_qsci - self.hf_energy)}")
+            if pauli_set == PAULI_IDENTITY:
+                continue
 
-        # self.corrected_energy.append(val_qsci + (1-hf_vec_qsci**2) * (val_qsci - self.hf_energy))
-        self.qsci_energy_history.append(val_qsci)
+            print(
+                f"pauli {pauli_set}, iter {n_pauli} in total {len(shots_map)}, shots {n_shot}")
 
-        return val_qsci
-        
+            circuit = self.construct_circuit(pauli_set)
+            transpiled_circuit = RZSetTranspiler()(circuit)
 
-    def run(self) -> float:
-
-        self.parametric_state_qsci = prepare_parametric_state(self.initial_state, self.pauli_rotation_circuit_qsci())
-
-        target_circuit = self.parametric_state_qsci.parametric_circuit.bind_parameters(self.param_values)
-        transpiled_circuit = RZSetTranspiler()(target_circuit)
-        self.comp_basis, _, val_qsci, hf_vec_qsci = self.run_qsci(transpiled_circuit)
-
-        print("initial energy", val_qsci)
-        print(f"initial basis: {[bin(b.bits)[2:].zfill(self.n_qubits) for b in self.comp_basis]}")
-        print(f"num basis: {len(self.comp_basis)}")
-        # print(f"davidson correction: {val_qsci + (1-hf_vec_qsci**2) * (val_qsci - self.hf_energy)}")
-
-        self.corrected_energy.append(val_qsci + (1-hf_vec_qsci**2) * (val_qsci - self.hf_energy))
-        self.qsci_energy_history.append(val_qsci)
-
-        optimizer = HillClimbing(val_qsci, c=0.01, ftol=10e-9)
-        opt_state = optimizer.get_init_state(self.param_values)
-
-        for itr in range(1, self.iter_max + 1):
-
-            print(f"------ {itr} --------")
             try:
-                opt_state = optimizer.step(opt_state, self.cost_fn)
+                counts = self.sampler(transpiled_circuit, n_shot)
             except ExceededError as e:
-                print(str(e))
-                return np.min(self.qsci_energy_history)
-                # return np.min(self.corrected_energy)
+                print(e)
+                return results_dict
 
+            normalize_term = sum(counts.values())
+            counts_normalized = {}
+            for key, count in counts.items():
+                counts_normalized[key] = count / normalize_term
 
-        return np.min(self.qsci_energy_history)
-        # return np.min(self.corrected_energy)
+            for key, count in counts_normalized.items():
+                if key in results_dict:
+                    results_dict[key] += counts_normalized[key] * \
+                        self.hamiltonian[pauli_set].real
+                else:
+                    results_dict[key] = counts_normalized[key] * \
+                        self.hamiltonian[pauli_set].real
+
+        return results_dict
 
 
 class PauliRotationCircuit:
@@ -219,41 +188,12 @@ class PauliRotationCircuit:
             )
         return circuit
 
-    # def add_new_gates(
-    #     self, generator: str, coeff: float, param_name: str
-    # ) -> LinearMappedUnboundParametricQuantumCircuit:
-    #     self._reset()
-    #     self.generetors_history.append(generator)
-    #     for i, (g, n) in enumerate(zip(self.generators[::-1], self.param_names[::-1])):
-    #         if is_equivalent(generator, g):
-    #             self.fusion_mem = [-i]
-    #             print(f"FUSED: {g, generator}")
-    #             break
-    #         elif is_commute(generator, g):
-    #             continue
-    #         else:
-    #             break
-    #     if not self.fusion_mem:
-    #         self.generators.append(generator)
-    #         self.coeffs.append(coeff)
-    #         self.param_names.append(param_name)
-    #     return self.construct_circuit()
-
-    def delete_newest_gate(self) -> LinearMappedUnboundParametricQuantumCircuit:
-        self._reset()
-        self.generators = self.generators[:-1]
-        self.coeffs = self.coeffs[:-1]
-        self.param_names = self.param_names[:-1]
-        return self.construct_circuit()
-
-    def _reset(self):
-        self.fusion_mem = []
-
 
 def diagonalize_effective_ham(
     ham_qp: Operator, comp_bases_qp: list[ComputationalBasisState]
 ) -> Tuple[np.ndarray, np.ndarray]:
-    effective_ham_sparse = generate_truncated_hamiltonian(ham_qp, comp_bases_qp)
+    effective_ham_sparse = generate_truncated_hamiltonian(
+        ham_qp, comp_bases_qp)
     assert np.allclose(effective_ham_sparse.todense().imag, 0)
     effective_ham_sparse = effective_ham_sparse.real
     if effective_ham_sparse.shape[0] > 10:
@@ -301,103 +241,35 @@ def generate_truncated_hamiltonian(
     return truncated_hamiltonian
 
 
-def _add_term_from_bsv(
-    bsvs: List[List[Tuple[int, int]]], ops: List[Operator]
-) -> Operator:
-    ret_op = Operator()
-    op0_bsv, op1_bsv = bsvs[0], bsvs[1]
-    op0, op1 = ops[0], ops[1]
-    for i0, (pauli0, coeff0) in enumerate(op0.items()):
-        for i1, (pauli1, coeff1) in enumerate(op1.items()):
-            bitwise_string = str(
-                bin(
-                    (op0_bsv[i0][0] & op1_bsv[i1][1])
-                    ^ (op0_bsv[i0][1] & op1_bsv[i1][0])
-                )
+def generate_truncated_hamiltonian_rectangle(
+    hamiltonian: Operator,
+    states1: Sequence[ComputationalBasisState],
+    states2: Sequence[ComputationalBasisState]
+) -> scipy.sparse.spmatrix:
+    """Generate truncated Hamiltonian on the given basis states."""
+
+    dim1 = len(states1)
+    dim2 = len(states2)
+    values = []
+    row_ids = []
+    column_ids = []
+    h_transition_amp_repr = transition_amp_representation(hamiltonian)
+    for m in range(dim1):
+        for n in range(dim2):
+            mn_val = transition_amp_comp_basis(
+                h_transition_amp_repr, states1[m].bits, states2[n].bits
             )
-            if bitwise_string.count("1") % 2 == 1:
-                pauli_prod_op, pauli_prod_phase = pauli_product(pauli0, pauli1)
-                tot_coef = 2 * coeff0 * coeff1 * pauli_prod_phase
-                ret_op.add_term(pauli_prod_op, tot_coef)
-    return ret_op
+            if mn_val:
+                values.append(mn_val)
+                row_ids.append(m)
+                column_ids.append(n)
 
+    truncated_hamiltonian = coo_matrix(
+        (values, (row_ids, column_ids)), shape=(dim1, dim2)
+    ).tocsc(copy=False)
+    truncated_hamiltonian.eliminate_zeros()
 
-def pauli_string_to_bsv(pauli_str: str) -> BinarySymplecticVector:
-    return pauli_label_to_bsv(pauli_label(pauli_str))
-
-
-def get_bsv(pauli: Union[PauliLabel, str]) -> BinarySymplecticVector:
-    if isinstance(pauli, str):
-        bsv = pauli_string_to_bsv(pauli)
-    else:
-        bsv = pauli_label_to_bsv(pauli)
-    return bsv
-
-
-def is_commute(pauli1: Union[PauliLabel, str], pauli2: Union[PauliLabel, str]) -> bool:
-    bsv1 = get_bsv(pauli1)
-    bsv2 = get_bsv(pauli2)
-    x1_z2 = bsv1.x & bsv2.z
-    z1_x2 = bsv1.z & bsv2.x
-    is_bitwise_commute_str = str(bin(x1_z2 ^ z1_x2)).split("b")[-1]
-    return sum(int(b) for b in is_bitwise_commute_str) % 2 == 0
-
-
-def is_equivalent(
-    pauli1: Union[PauliLabel, str], pauli2: Union[PauliLabel, str]
-) -> bool:
-    bsv1 = get_bsv(pauli1)
-    bsv2 = get_bsv(pauli2)
-    return bsv1.x == bsv2.x and bsv1.z == bsv2.z
-
-
-def operator_bsv(op: Operator) -> List[Tuple[int, int]]:
-    ret = []
-    for pauli in op.keys():
-        bsv_pauli = get_bsv(pauli)
-        ret.append((bsv_pauli.x, bsv_pauli.z))
-    return ret
-
-
-def round_hamiltonian(op: Operator, num_pickup: int = None, coeff_cutoff: float = None):
-    ret_op = Operator()
-    if coeff_cutoff in [None, 0.0] and num_pickup is None:
-        return op
-    sorted_pauli = sorted(op.keys(), key=lambda x: abs(op[x]), reverse=True)
-    if num_pickup is not None:
-        sorted_pauli = sorted_pauli[:num_pickup]
-    if coeff_cutoff is None:
-        coeff_cutoff = 0
-    for pauli in sorted_pauli:
-        coeff = op[pauli]
-        if abs(coeff) < coeff_cutoff:
-            pass
-        else:
-            ret_op += Operator({pauli: coeff})
-    return ret_op
-
-
-
-
-def prepare_parametric_state(initial_state, ansatz):
-    circuit = LinearMappedUnboundParametricQuantumCircuit(initial_state.qubit_count)
-    circuit += initial_state.circuit
-    circuit += ansatz
-    return ParametricCircuitQuantumState(initial_state.qubit_count, circuit)
-
-
-def key_sortedabsval(data: Union[list, dict, np.ndarray], round_: int = 5) -> dict:
-    if isinstance(data, dict):
-        sorted_keys = sorted(data.keys(), key=lambda x: abs(data[x]), reverse=True)
-    else:
-        sorted_keys = np.argsort(np.abs(data))[::-1]
-    ret_dict = {}
-    for k in sorted_keys:
-        val = float(data[int(k)].real)
-        assert np.isclose(val.imag, 0.0)
-        ret_dict[int(k)] = round(val, round_)
-    return ret_dict
-
+    return truncated_hamiltonian
 
 
 def num_basis_symmetry_adapted_cisd(n_qubits: int):
@@ -408,25 +280,54 @@ def num_basis_symmetry_adapted_cisd(n_qubits: int):
 def pick_up_bits_from_counts(
     counts: Mapping[int, Union[int, float]],
     n_qubits,
+    n_ele,
     R_max=None,
     threshold=None,
-    post_select=False,
-    n_ele=None,
 ):
-    sorted_keys = sorted(counts.keys(), key=lambda x: counts[x], reverse=True)
+
+    sorted_keys = sorted(counts.keys(), key=lambda x: abs(counts[x]), reverse=True)
+
     if threshold is None:
         heavy_bits = sorted_keys
     else:
-        heavy_bits = [bit for bit in sorted_keys if counts[bit] >= threshold]
-    if post_select:
-        assert n_ele is not None
-        heavy_bits = [i for i in heavy_bits if bin(i).count("1") == n_ele]
+        heavy_bits = [bit for bit in sorted_keys if abs(counts[bit]) >= threshold]
+
+    heavy_bits = [i for i in heavy_bits if bin(i).count("1") == n_ele]
+
+    heavy_bits = [i for i in heavy_bits if bin(
+        i >> (n_qubits//2)).count("1") != 2 and bin(i >> (n_qubits//2)).count("1") != 0]
+
     if R_max is not None:
         heavy_bits = heavy_bits[:R_max]
     comp_bases_qp = [
         ComputationalBasisState(n_qubits, bits=int(key)) for key in heavy_bits
     ]
     return comp_bases_qp, heavy_bits
+
+
+def round_hamiltonian(op: Operator, num_pickup: int = None, coeff_cutoff: float = None):
+    ret_op = Operator()
+
+    sorted_pauli = sorted(op.keys(), key=lambda x: abs(op[x]), reverse=True)
+
+    if coeff_cutoff is None:
+        coeff_cutoff = 0
+
+    for pauli in sorted_pauli:
+
+        if pauli == PAULI_IDENTITY or np.all(np.array(pauli.index_and_pauli_id_list[1]) == 3):
+            continue
+
+        coeff = op[pauli]
+        if abs(coeff) < coeff_cutoff:
+            pass
+        else:
+            ret_op += Operator({pauli: coeff})
+
+    if num_pickup is not None:
+        sorted_pauli = sorted_pauli[:num_pickup]
+
+    return ret_op
 
 
 class RunAlgorithm:
@@ -454,9 +355,12 @@ class RunAlgorithm:
         jw_hamiltonian = jordan_wigner(ham)
         qp_hamiltonian = operator_from_openfermion_op(jw_hamiltonian)
 
+        # print([m for m in qp_hamiltonian])
+
+        # print(qp_hamiltonian.keys())
 
         hf_bits = 2 ** n_electrons - 1
-        comp_bases_qp = [
+        comp_bases_sd = [
             ComputationalBasisState(n_qubits, bits=hf_bits ^ sum([1 << i for i in ies]) ^ sum([1 << j for j in js])) for m in range(0, 3) for ies in itertools.combinations(range(0, int(n_qubits/2)), m) for js in itertools.combinations(range(int(n_qubits/2), n_qubits), m)
         ]
 
@@ -465,50 +369,72 @@ class RunAlgorithm:
         )
         print("hf energy ", hf_energy)
 
-        vec_qsci, val_qsci = diagonalize_effective_ham(
-            qp_hamiltonian, comp_bases_qp
+        vec_cisd, val_cisd = diagonalize_effective_ham(
+            qp_hamiltonian, comp_bases_sd
         )
 
-        # print([(b.bits, v) for b, v in zip(comp_bases_qp, vec_qsci)])
-
-        for th in [0, 0.01]:
-            th_base = [b for i, b in enumerate(comp_bases_qp) if abs(vec_qsci[i]) > th]
-            vec_qscith, val_qscith = diagonalize_effective_ham(
+        for th in [0, 0.015]:
+            th_base = [b for i, b in enumerate(
+                comp_bases_sd) if abs(vec_cisd[i]) > th]
+            vec_th, val_th = diagonalize_effective_ham(
                 qp_hamiltonian, th_base
             )
-            print(f"{th}: {val_qscith}, {len(th_base)}")
+            print(f"{th}: {val_th}, {len(th_base)}")
 
+        num_pickup, coeff_cutoff = 10000, 0.001
+        print("original hamiltonian len", len(qp_hamiltonian))
+        pt2_hamiltonian = round_hamiltonian(
+            qp_hamiltonian, num_pickup, coeff_cutoff)
+        print("rounded hamiltonian len", len(pt2_hamiltonian))
 
         cisd_coeffs = []
-        for coef, base in zip(vec_qscith, th_base):
+        for coef, base in zip(vec_th, th_base):
             if base.bits != hf_bits:
-                virtual = [i for i in range(int(n_qubits/2), n_qubits) if (1<<i) & base.bits]
-                occupied = [i for i in range(0, int(n_qubits/2)) if (1<<i) & base.bits == 0]
+                virtual = [i for i in range(
+                    int(n_qubits/2), n_qubits) if (1 << i) & base.bits]
+                occupied = [i for i in range(
+                    0, int(n_qubits/2)) if (1 << i) & base.bits == 0]
                 cisd_coeffs.append((coef, virtual, occupied))
 
         cisd_coeffs = sorted(cisd_coeffs, key=lambda x: - abs(x[0]))
 
-        post_selection = True
         mps_sampler = challenge_sampling.create_sampler()
 
-        adapt_qsci = ADAPT_QSCI(
-            qp_hamiltonian,
+        quant_pt2 = QuantumPT2(
+            pt2_hamiltonian,
             # pool,
-            cisd_coeffs = cisd_coeffs,
+            cisd_coeffs=cisd_coeffs,
             n_qubits=n_qubits,
             n_ele_cas=n_electrons,
             sampler=mps_sampler,
-            iter_max=100000,
-            post_selected=post_selection,
-            sampling_shots=10**5,
-            # sampling_shots=10**4,
             atol=1e-6,
-            final_sampling_shots_coeff=1,
-            max_num_converged=2000,
-            hf_energy=hf_energy
+            total_shots=10**7
         )
-        res = adapt_qsci.run()
-        return res
+        results_dict = quant_pt2.run()
+        print(results_dict)
+
+        print("post processing")
+        comp_basis_pt2, heavy_bits = pick_up_bits_from_counts(
+            results_dict, n_qubits=n_qubits, n_ele=n_electrons, R_max=50000, threshold=0.00001)
+
+        print(comp_basis_pt2)
+        print("number of perturbation comp basis", len(comp_basis_pt2))
+
+        perturb_hamiltonian = np.array(generate_truncated_hamiltonian_rectangle(
+            qp_hamiltonian, comp_bases_sd, comp_basis_pt2).todense().real)
+        perturb_hamiltonian_diag = np.array([generate_truncated_hamiltonian(
+            qp_hamiltonian, [c]).todense()[0, 0] for c in comp_basis_pt2]).real
+
+        # print(perturb_hamiltonian_diag)
+        # print(perturb_hamiltonian)
+        # print(perturb_hamiltonian_diag - val_cisd)
+        # print(np.abs(perturb_hamiltonian.T @ vec_cisd))
+
+        pt2_energy = np.sum(np.abs(perturb_hamiltonian.T @ vec_cisd)
+                            ** 2 / (perturb_hamiltonian_diag - val_cisd))
+        print(pt2_energy)
+
+        return val_cisd - pt2_energy
 
 
 if __name__ == "__main__":
