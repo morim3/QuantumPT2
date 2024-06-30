@@ -141,9 +141,9 @@ class ADAPT_QSCI:
         print(f"num basis: {len(comp_basis)}")
         print(f"qsci energy for this param values: {val_qsci}")
         print(f"hf_energy: ", self.hf_energy, " hf_vec: ", hf_vec_qsci)
-        print(f"davidson correction: {val_qsci + (1-hf_vec_qsci**2) * (val_qsci - self.hf_energy)}")
+        # print(f"davidson correction: {val_qsci + (1-hf_vec_qsci**2) * (val_qsci - self.hf_energy)}")
 
-        self.corrected_energy.append(val_qsci + (1-hf_vec_qsci**2) * (val_qsci - self.hf_energy))
+        # self.corrected_energy.append(val_qsci + (1-hf_vec_qsci**2) * (val_qsci - self.hf_energy))
         self.qsci_energy_history.append(val_qsci)
 
         return val_qsci
@@ -160,12 +160,12 @@ class ADAPT_QSCI:
         print("initial energy", val_qsci)
         print(f"initial basis: {[bin(b.bits)[2:].zfill(self.n_qubits) for b in self.comp_basis]}")
         print(f"num basis: {len(self.comp_basis)}")
-        print(f"davidson correction: {val_qsci + (1-hf_vec_qsci**2) * (val_qsci - self.hf_energy)}")
+        # print(f"davidson correction: {val_qsci + (1-hf_vec_qsci**2) * (val_qsci - self.hf_energy)}")
 
         self.corrected_energy.append(val_qsci + (1-hf_vec_qsci**2) * (val_qsci - self.hf_energy))
         self.qsci_energy_history.append(val_qsci)
 
-        optimizer = HillClimbing(val_qsci, c=0.001, ftol=10e-9)
+        optimizer = HillClimbing(val_qsci, c=0.01, ftol=10e-9)
         opt_state = optimizer.get_init_state(self.param_values)
 
         for itr in range(1, self.iter_max + 1):
@@ -175,12 +175,12 @@ class ADAPT_QSCI:
                 opt_state = optimizer.step(opt_state, self.cost_fn)
             except ExceededError as e:
                 print(str(e))
-                # return np.min(self.qsci_energy_history)
-                return np.min(self.corrected_energy)
+                return np.min(self.qsci_energy_history)
+                # return np.min(self.corrected_energy)
 
 
-        # return np.min(self.qsci_energy_history)
-        return np.min(self.corrected_energy)
+        return np.min(self.qsci_energy_history)
+        # return np.min(self.corrected_energy)
 
 
 class PauliRotationCircuit:

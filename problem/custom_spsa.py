@@ -31,6 +31,11 @@ from quri_parts.algo.optimizer.tolerance import ftol as create_ftol
 class OptimizerStateSPSA(OptimizerState):
     rng: np.random.Generator = np.random.default_rng()
 
+@dataclass(frozen=True)
+class OptimizerStateHill(OptimizerState):
+    """An immutable (frozen) dataclass representing an optimizer state."""
+    rng: np.random.Generator = np.random.default_rng()
+    current_index: int = 0
 
 class SPSA(Optimizer):
     r"""Simultaneous perturbation stochastic approximation (SPSA) optimizer. The
@@ -245,43 +250,42 @@ class HillClimbing(Optimizer):
     def get_init_state(self, init_params: Params) -> OptimizerStateSPSA:
         params = readonly_array(np.array(init_params, dtype=float))
         rng = np.random.default_rng(seed=self._rng_seed)
-        return OptimizerStateSPSA(
+        return OptimizerStateHill(
             params=params,
             rng=rng,
         )
 
     def step(
         self,
-        state: OptimizerState,
+        state: OptimizerStateHill,
         cost_function: CostFunction,
         grad_function: Optional[GradientFunction] = None,
     ) -> OptimizerStateSPSA:
-        if not isinstance(state, OptimizerStateSPSA):
-            raise ValueError('state must have type "OptimizerStateSPSA".')
 
         rng = state.rng
 
         funcalls = state.funcalls
         gradcalls = state.gradcalls
         niter = state.niter + 1
+        current_opt_index = state.current_index
 
         params = state.params.copy()
 
+        delta = 2 * rng.integers(2, size=1) - 1
 
-        delta = 2 * rng.integers(2, size=state.n_params) - 1
+        params_plus = params[-current_opt_index] + delta * self._c * params[-current_opt_index]
+        params[-current_opt_index] = params_plus
 
-        ck = self._c / (state.niter + 1) ** self._gamma
-        params_plus = params + delta * ck
-
-        funval = cost_function(params_plus)
+        funval = cost_function(params)
         funcalls += 1
 
         if funval < self.current_best:
             self.current_best = funval
-            params = params_plus 
+        else:
+            params = state.params
 
 
-        return OptimizerStateSPSA(
+        return OptimizerStateHill(
             params=readonly_array(params),
             cost=self.current_best,
             status=OptimizerStatus.SUCCESS,
@@ -289,4 +293,5 @@ class HillClimbing(Optimizer):
             funcalls=funcalls,
             gradcalls=gradcalls,
             rng=rng,
+            current_index=(current_opt_index + 1) % state.n_params
         )
